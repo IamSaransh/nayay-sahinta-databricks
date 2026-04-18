@@ -1,238 +1,209 @@
 """
-LangExtract integration for Nyaya-Sahayak.
-Extracts structured legal information from PDF text and user input.
-Uses a custom OpenAI-compatible provider pointing to Sarvam-M via HF.
+Self-contained mapping extractor using legal_extractor's LLM setup.
+Chunks the PDF properly to extract 300+ mappings.
+Run from project root: python generate_mappings.py
 """
-
-from __future__ import annotations
-import sys, os, json, textwrap
+import sys, os, json, re, time
 from pathlib import Path
-from typing import Optional
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+ROOT = Path(__file__).parent
+sys.path.insert(0, str(ROOT))
+
+# Load env so LLM creds work
+from dotenv import load_dotenv
+load_dotenv(str(ROOT / ".env"))
+
 from nyaya_sahayak.config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, ROOT
+from nyaya_sahayak.comparator import _BUILTIN_MAPPING, IPC_BNS_MAPPING_PATH
+from openai import OpenAI
 
-# ── Schema Definitions ──────────────────────────────────────────────────────────
-LEGAL_EXTRACTION_PROMPT = textwrap.dedent("""\
-    Extract legal entities from Indian legal text.
-    For each entity, identify:
-    - The section number (IPC or BNS)
-    - The offence/provision name
-    - The punishment/consequence
-    - Key conditions or exceptions
-    Use EXACT text from the document. Do not paraphrase.
-""")
+# ── Config ───────────────────────────────────────────────────────────────────
+CHUNK_SIZE   = 3000   # chars per chunk sent to LLM
+CHUNK_OVERLAP = 300   # overlap so section boundaries aren't missed
+SLEEP_BETWEEN_CHUNKS = 1.5  # seconds, avoids rate limiting
+PDF_FILES = [
+    ROOT / "repealedfileopen.pdf",
+    ROOT / "250883_english_01042024.pdf",
+]
 
-MAPPING_EXTRACTION_PROMPT = textwrap.dedent("""\
-    Extract IPC to BNS section correspondence from legal text.
-    Identify pairs where an old IPC section maps to a new BNS section.
-    Include the section numbers and section names for both.
-""")
+# ── LLM Client ───────────────────────────────────────────────────────────────
+def get_client():
+    return OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL, timeout=120.0)
 
-# ── LangExtract with Custom Provider ───────────────────────────────────────────
-def _build_langextract_examples():
-    """Build few-shot examples for LangExtract."""
-    try:
-        import langextract as lx
-        examples = [
-            lx.data.ExampleData(
-                text="Section 103 of BNS: Whoever commits murder shall be punished with death or imprisonment for life and shall also be liable to fine. (Old IPC Section 302)",
-                extractions=[
-                    lx.data.Extraction(
-                        extraction_class="bns_section",
-                        extraction_text="Section 103 of BNS",
-                        attributes={"section_num": "103", "law": "BNS", "offence": "Murder"}
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="punishment",
-                        extraction_text="death or imprisonment for life and shall also be liable to fine",
-                        attributes={"type": "death/life", "fine": "yes"}
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="ipc_equivalent",
-                        extraction_text="Old IPC Section 302",
-                        attributes={"section_num": "302", "law": "IPC"}
-                    ),
-                ]
-            ),
-            lx.data.ExampleData(
-                text="BNS Section 318 corresponds to IPC 415 and 420. Cheating: Whoever, by deceiving any person, fraudulently induces them, shall be punished with imprisonment up to 3 years.",
-                extractions=[
-                    lx.data.Extraction(
-                        extraction_class="bns_section",
-                        extraction_text="BNS Section 318",
-                        attributes={"section_num": "318", "law": "BNS", "offence": "Cheating"}
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="ipc_equivalent",
-                        extraction_text="IPC 415",
-                        attributes={"section_num": "415", "law": "IPC"}
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="ipc_equivalent",
-                        extraction_text="IPC 420",
-                        attributes={"section_num": "420", "law": "IPC"}
-                    ),
-                    lx.data.Extraction(
-                        extraction_class="punishment",
-                        extraction_text="imprisonment up to 3 years",
-                        attributes={"duration": "3 years", "type": "imprisonment"}
-                    ),
-                ]
-            ),
-        ]
-        return examples
-    except ImportError:
-        return None
+# ── Extract from one chunk ────────────────────────────────────────────────────
+def extract_mappings_from_chunk(chunk: str, client, chunk_num: int) -> list[dict]:
+    prompt = f"""You are analyzing Indian legal text that shows the transition from IPC (Indian Penal Code 1860) to BNS (Bharatiya Nyaya Sanhita 2023).
 
+Extract ALL IPC → BNS section mappings from the text below.
+Return ONLY a valid JSON array. No explanation, no markdown, just the array.
 
-def extract_from_text(text: str, use_mapping_mode: bool = False) -> dict:
-    """
-    Extract structured legal entities from text using LangExtract.
-    Falls back to LLM-based extraction if LangExtract is unavailable.
-    
-    Returns dict with keys: sections, punishments, ipc_mappings
-    """
-    prompt = MAPPING_EXTRACTION_PROMPT if use_mapping_mode else LEGAL_EXTRACTION_PROMPT
+Format:
+[
+  {{
+    "ipc_section": "302",
+    "ipc_name": "Punishment for Murder",
+    "bns_section": "103",
+    "bns_name": "Punishment for Murder",
+    "category": "Homicide",
+    "note": "Brief note on key change if any"
+  }}
+]
+
+Rules:
+- Only include entries where BOTH an IPC section number AND a BNS section number are clearly identifiable
+- If a BNS section has no IPC equivalent, use "NEW" as ipc_section
+- If an IPC section was repealed with no BNS equivalent, use "REPEALED" as bns_section
+- category should be one of: Homicide, Women, Sexual Offences, Kidnapping, Trafficking, Property, Fraud, Forgery, Public Order, State Security, Reputation, Intimidation, Marriage, Domestic Violence, Public Servant, Justice, Organised Crime, Terrorism, Hurt, Other
+- Extract as many mappings as you can find, even partial ones
+
+Text:
+{chunk}
+
+JSON array:"""
 
     try:
-        import langextract as lx
-        examples = _build_langextract_examples()
-        if examples is None:
-            raise ImportError("LangExtract examples failed")
-
-        # Use OpenAI provider with HF endpoint
-        result = lx.extract(
-            text_or_documents=text[:8000],  # Limit for API
-            prompt_description=prompt,
-            examples=examples,
-            model_id="gpt-4o",           # Will be remapped to HF endpoint
-            api_key=LLM_API_KEY,
-            fence_output=True,
-            use_schema_constraints=False,
+        client_obj = get_client()
+        response = client_obj.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2000,
+            temperature=0.0,
         )
+        raw = response.choices[0].message.content or ""
 
-        # Parse results
-        sections, punishments, mappings = [], [], []
-        for ext in result.extractions:
-            if ext.char_interval is None:
-                continue  # Skip hallucinated extractions
-            cls = ext.extraction_class
-            attrs = ext.attributes or {}
-            entry = {"text": ext.extraction_text, **attrs}
-            if cls == "bns_section":
-                sections.append(entry)
-            elif cls == "punishment":
-                punishments.append(entry)
-            elif cls == "ipc_equivalent":
-                mappings.append(entry)
+        # Strip markdown fences if present
+        raw = re.sub(r"```json|```", "", raw).strip()
 
-        return {"sections": sections, "punishments": punishments, "ipc_mappings": mappings, "source": "langextract"}
+        # Find JSON array
+        match = re.search(r'\[.*\]', raw, re.DOTALL)
+        if not match:
+            print(f"  [Chunk {chunk_num}] No JSON array found in response")
+            return []
 
+        data = json.loads(match.group())
+        if isinstance(data, list):
+            print(f"  [Chunk {chunk_num}] Extracted {len(data)} mappings")
+            return data
+    except json.JSONDecodeError as e:
+        print(f"  [Chunk {chunk_num}] JSON parse error: {e}")
     except Exception as e:
-        print(f"[LangExtract] Falling back to LLM extraction: {e}")
-        return _llm_extract(text, use_mapping_mode)
+        print(f"  [Chunk {chunk_num}] LLM error: {e}")
+    return []
 
+# ── Read entire PDF ───────────────────────────────────────────────────────────
+def read_full_pdf(pdf_path: Path) -> str:
+    import pdfplumber
+    texts = []
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        total = len(pdf.pages)
+        print(f"  PDF has {total} pages — reading all...")
+        for i, page in enumerate(pdf.pages):   # ← no page limit
+            t = page.extract_text() or ""
+            if t.strip():
+                texts.append(t)
+            if (i+1) % 20 == 0:
+                print(f"  Read {i+1}/{total} pages...")
+    return "\n".join(texts)
 
-def _llm_extract(text: str, use_mapping_mode: bool) -> dict:
-    """
-    LLM-based structured extraction fallback using Sarvam-M.
-    Returns structured JSON via prompt engineering.
-    """
-    from nyaya_sahayak.llm_client import chat
+# ── Chunk text with overlap ───────────────────────────────────────────────────
+def chunk_text(text: str) -> list[str]:
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + CHUNK_SIZE
+        chunks.append(text[start:end])
+        start += CHUNK_SIZE - CHUNK_OVERLAP
+    print(f"  Split into {len(chunks)} chunks of ~{CHUNK_SIZE} chars")
+    return chunks
 
-    if use_mapping_mode:
-        prompt = f"""Extract IPC to BNS section mappings from this legal text.
-Return ONLY valid JSON in this exact format:
-{{
-  "mappings": [
-    {{"ipc_section": "302", "ipc_name": "Murder", "bns_section": "103", "bns_name": "Murder"}}
-  ]
-}}
+# ── Validate a single mapping row ────────────────────────────────────────────
+def is_valid(entry: dict) -> bool:
+    ipc = str(entry.get("ipc_section", "")).strip()
+    bns = str(entry.get("bns_section", "")).strip()
+    ipc_name = str(entry.get("ipc_name", "")).strip()
+    bns_name = str(entry.get("bns_name", "")).strip()
+    # Must have section numbers and names
+    if not ipc or not bns:
+        return False
+    if not ipc_name or not bns_name:
+        return False
+    # IPC section must be a number or NEW
+    if ipc not in ("NEW",) and not re.match(r'^\d{1,3}[A-Z]?$', ipc):
+        return False
+    return True
 
-Text:
-{text[:3000]}"""
-        response = chat([{"role": "user", "content": prompt}], max_tokens=800, temperature=0.0)
-        try:
-            json_match = __import__('re').search(r'\{.*\}', response, __import__('re').DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-                return {"sections": [], "punishments": [], "ipc_mappings": data.get("mappings", []), "source": "llm_fallback"}
-        except Exception:
-            pass
-    else:
-        prompt = f"""Extract legal entities from this text. Return ONLY valid JSON:
-{{
-  "sections": [{{"section_num": "103", "law": "BNS", "offence": "Murder", "text": "..."}}],
-  "punishments": [{{"section_ref": "103", "punishment": "death or life imprisonment"}}]
-}}
+# ── Main ─────────────────────────────────────────────────────────────────────
+def main():
+    client = get_client()
+    all_mappings = []
 
-Text:
-{text[:3000]}"""
-        response = chat([{"role": "user", "content": prompt}], max_tokens=800, temperature=0.0)
-        try:
-            json_match = __import__('re').search(r'\{.*\}', response, __import__('re').DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-                return {"sections": data.get("sections",[]), "punishments": data.get("punishments",[]),
-                        "ipc_mappings": [], "source": "llm_fallback"}
-        except Exception:
-            pass
+    # Start with built-in mappings
+    builtin_df = pd.DataFrame(_BUILTIN_MAPPING)
+    print(f"Starting with {len(builtin_df)} built-in mappings")
+    all_mappings.extend(_BUILTIN_MAPPING)
 
-    return {"sections": [], "punishments": [], "ipc_mappings": [], "source": "failed"}
+    # Process each PDF
+    for pdf_path in PDF_FILES:
+        if not pdf_path.exists():
+            print(f"\n⚠️  PDF not found, skipping: {pdf_path.name}")
+            continue
 
+        print(f"\n📄 Processing: {pdf_path.name}")
+        full_text = read_full_pdf(pdf_path)
+        print(f"  Total text length: {len(full_text):,} chars")
 
-def extract_from_pdf(pdf_path: Path, use_mapping_mode: bool = False) -> dict:
-    """Extract structured entities from a PDF file."""
-    try:
-        import pdfplumber
-        texts = []
-        with pdfplumber.open(str(pdf_path)) as pdf:
-            for page in pdf.pages[:50]:  # First 50 pages
-                texts.append(page.extract_text() or "")
-        text = "\n".join(texts)
-        return extract_from_text(text, use_mapping_mode=use_mapping_mode)
-    except Exception as e:
-        return {"error": str(e), "sections": [], "punishments": [], "ipc_mappings": []}
+        chunks = chunk_text(full_text)
+        pdf_mappings = []
 
+        for i, chunk in enumerate(chunks):
+            print(f"\n  Chunk {i+1}/{len(chunks)}...")
+            extracted = extract_mappings_from_chunk(chunk, client, i+1)
+            pdf_mappings.extend(extracted)
+            time.sleep(SLEEP_BETWEEN_CHUNKS)
 
-def build_mapping_from_pdfs() -> pd.DataFrame:
-    """
-    Extract IPC→BNS mappings from both PDFs and merge with built-in mapping.
-    Returns a DataFrame.
-    """
-    from nyaya_sahayak.comparator import _BUILTIN_MAPPING, IPC_BNS_MAPPING_PATH
+        print(f"\n  Raw extracted from {pdf_path.name}: {len(pdf_mappings)}")
+        all_mappings.extend(pdf_mappings)
 
-    # Start with built-in mapping
-    df = pd.DataFrame(_BUILTIN_MAPPING)
+    # Build DataFrame and clean up
+    df = pd.DataFrame(all_mappings)
 
-    # Try to extract more from PDFs
-    for pdf_path in [ROOT / "repealedfileopen.pdf", ROOT / "250883_english_01042024.pdf"]:
-        if pdf_path.exists():
-            print(f"[LangExtract] Extracting mappings from {pdf_path.name}...")
-            result = extract_from_pdf(pdf_path, use_mapping_mode=True)
-            new_maps = result.get("ipc_mappings", [])
-            if new_maps:
-                new_df = pd.DataFrame(new_maps)
-                # Align columns
-                for col in ["ipc_section","ipc_name","bns_section","bns_name","category","note"]:
-                    if col not in new_df.columns:
-                        new_df[col] = ""
-                df = pd.concat([df, new_df[df.columns.tolist()]], ignore_index=True)
-                print(f"[LangExtract] Added {len(new_maps)} mappings from {pdf_path.name}")
+    # Ensure all required columns exist
+    for col in ["ipc_section", "ipc_name", "bns_section", "bns_name", "category", "note"]:
+        if col not in df.columns:
+            df[col] = ""
 
-    # Deduplicate
-    df = df.drop_duplicates(subset=["ipc_section","bns_section"])
+    # Normalize types
+    df["ipc_section"] = df["ipc_section"].astype(str).str.strip()
+    df["bns_section"] = df["bns_section"].astype(str).str.strip()
+    df["ipc_name"]    = df["ipc_name"].astype(str).str.strip()
+    df["bns_name"]    = df["bns_section"].astype(str).str.strip()
+    df["category"]    = df["category"].astype(str).str.strip()
+    df["note"]        = df["note"].astype(str).str.strip()
+
+    # Filter invalid rows
+    before = len(df)
+    df = df[df.apply(is_valid, axis=1)]
+    print(f"\n  Removed {before - len(df)} invalid rows")
+
+    # Deduplicate — keep first occurrence (built-in takes priority)
+    df = df.drop_duplicates(subset=["ipc_section", "bns_section"], keep="first")
+
+    # Sort nicely
+    def sort_key(s):
+        try: return (0, int(re.sub(r'[A-Z]', '', s)))
+        except: return (1, s)
+    df["_sort"] = df["ipc_section"].apply(sort_key)
+    df = df.sort_values("_sort").drop(columns=["_sort"])
+
+    # Save
+    IPC_BNS_MAPPING_PATH.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(IPC_BNS_MAPPING_PATH, index=False)
-    print(f"[LangExtract] Final mapping: {len(df)} entries → {IPC_BNS_MAPPING_PATH}")
-    return df
 
+    print(f"\n✅ Final mapping: {len(df)} entries saved to:")
+    print(f"   {IPC_BNS_MAPPING_PATH}")
+    print(f"\nSample:")
+    print(df[["ipc_section","ipc_name","bns_section","bns_name","category"]].head(10).to_string())
 
 if __name__ == "__main__":
-    # Test extraction
-    test_text = """BNS Section 103 deals with punishment for murder.
-    Whoever commits murder shall be punished with death or imprisonment for life.
-    This corresponds to IPC Section 302."""
-    result = extract_from_text(test_text)
-    print(json.dumps(result, indent=2))
+    main()

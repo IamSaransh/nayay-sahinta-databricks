@@ -177,7 +177,7 @@ with col_lang:
 with col_stat1:
     st.metric("BNS Sections", "358")
 with col_stat2:
-    st.metric("IPC→BNS Maps", "50+")
+    st.metric("IPC→BNS Maps", "300+")
 with col_stat3:
     st.metric("Gov Schemes", "12")
 
