@@ -170,15 +170,21 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Language Toggle ─────────────────────────────────────────────────────────────
-col_lang, col_stat1, col_stat2, col_stat3 = st.columns([2,1,1,1])
+col_lang, col_stat1, col_stat2, col_stat3, col_stat4 = st.columns([2,1,1,1,1])
 with col_lang:
-    language = st.selectbox("🌐 Language / भाषा", ["English", "हिंदी"], label_visibility="collapsed")
-    lang_code = "hi" if language == "हिंदी" else "en"
+    st.markdown("""
+    <div class="card" style="padding:.6rem 1rem; text-align:center;">
+        🌐 Type in your preferred language
+    </div>
+    """, unsafe_allow_html=True)
+    lang_code = "auto"
 with col_stat1:
-    st.metric("BNS Sections", "358")
+    st.metric("Languages Supported", "22+")
 with col_stat2:
-    st.metric("IPC→BNS Maps", "300+")
+    st.metric("BNS Sections", "358")
 with col_stat3:
+    st.metric("IPC→BNS Maps", "300+")
+with col_stat4:
     st.metric("Gov Schemes", "12")
 
 st.markdown("<hr>", unsafe_allow_html=True)
@@ -251,8 +257,18 @@ with tab1:
                 context = engine.format_context(ctx_results)
                 # Build message
                 system_ctx = f"\n\nRelevant BNS context:\n{context}" if context else ""
-                messages = [{"role": "user", "content": user_q + system_ctx}]
-                answer = llm_chat(messages, language=lang_code, max_tokens=900)
+                messages = [{
+                        "role": "user",
+                         "content": f"""
+                         Respond in the SAME language as the user's question.
+
+                        User Question:
+                        {user_q}
+
+                        {system_ctx}
+                        """
+                    }]
+                answer = llm_chat(messages, language="auto", max_tokens=900)
             except Exception as e:
                 answer = f"⚠️ Error: {e}\n\nPlease ensure your HF token is set in `.env`."
 
@@ -294,7 +310,7 @@ with tab2:
             with st.spinner("Querying BNS & IPC indices…"):
                 try:
                     comp = load_comparator()
-                    result = comp.compare_scenario(scenario, language=lang_code)
+                    result = comp.compare_scenario(scenario, language="auto")
                 except Exception as e:
                     st.error(f"Error: {e}")
                     result = None
@@ -412,7 +428,7 @@ with tab3:
                         {"role": "user", "content":
                          f"Explain the change from IPC {result['ipc_section']} ({result['ipc_name']}) "
                          f"to BNS {bns_sec} ({result['bns_name']}). What are the key differences?"}
-                    ], language=lang_code, max_tokens=500)
+                    ], language="auto", max_tokens=500)
                 st.markdown(f'<div class="msg-bot">⚖️ {explanation}</div>', unsafe_allow_html=True)
         else:
             st.warning(f"IPC Section {ipc_input} not found in mapping table. Try the chatbot for manual lookup.")
@@ -473,7 +489,7 @@ with tab4:
         with st.spinner("Matching schemes…"):
             try:
                 checker = load_checker()
-                result = checker.check_eligibility(profile, language=lang_code)
+                result = checker.check_eligibility(profile, language="auto")
             except Exception as e:
                 st.error(f"Error: {e}")
                 result = None
