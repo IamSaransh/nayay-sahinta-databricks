@@ -66,4 +66,15 @@ databricks secrets put-secret nyaya_secrets sarvam_api_key
 * Select this GitHub repository as your source (Ensure it is tracked, or select **Workspace** and drag the file contents).
 * Databricks seamlessly reads the included `app.yaml`, safely injects the Sarvam token from the `nyaya_secrets` vault, auto-applies cluster configurations, and boots the Streamlit application!
 
-Enjoy super-fast, semantic legal retrieval on enterprise-grade infrastructure! 🚀
+### Option 3: Deploy to Streamlit Community Cloud ☁️
+
+For a quick, public-facing web URL, you can deploy directly to Streamlit Cloud.
+
+1. **Connect GitHub:** Link your GitHub account to [Streamlit Cloud](https://share.streamlit.io/).
+2. **Configure Secrets:** In the Streamlit App settings, go to **Advanced Settings -> Secrets** and add your credentials:
+   ```toml
+   DATABRICKS_HOST = "https://community.cloud.databricks.com"
+   DATABRICKS_TOKEN = "your_token"
+   SARVAM_API_KEY = "your_sarvam_key"
+   ```
+3. **Deploy:** Streamlit will automatically install dependencies from `requirements.txt` and launch the app!
