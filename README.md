@@ -52,12 +52,14 @@ We deployed the frontend seamlessly via *Databricks Apps*. Databricks manages th
 
 ## ⚙️ Deployed App Links
 Databricks Deployed App Link -> https://nayaya-sahita-7474652331921818.aws.databricksapps.com/
+
 Fallback Streamlit Deployed App Link -> https://nayay-sahinta-databricks-kb7ijl7djggdtn5dnr66dz.streamlit.app/
 
 ---
 
 ## ⚙️ App Usage Video Link
 Google Drive Link -> https://drive.google.com/file/d/1fbFcI0ha44JlQqHktGiAL_S32zpHyIuw/view
+
 Youtube Link -> https://youtu.be/W8Q8LSjpQWE
 
 ---
