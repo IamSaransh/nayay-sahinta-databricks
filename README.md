@@ -67,3 +67,8 @@ databricks secrets put-secret nyaya_secrets sarvam_api_key
 * Databricks seamlessly reads the included `app.yaml`, safely injects the Sarvam token from the `nyaya_secrets` vault, auto-applies cluster configurations, and boots the Streamlit application!
 
 Enjoy super-fast, semantic legal retrieval on enterprise-grade infrastructure! 🚀
+
+
+**Deployed App Links**
+Databricks Deployed App Link -> https://nayaya-sahita-7474652331921818.aws.databricksapps.com/
+Fallback Streamlit Deployed App Link -> 
